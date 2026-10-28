@@ -1,0 +1,86 @@
+const fs = require('fs');
+const path = require('path');
+const solc = require('solc');
+const ganache = require('ganache');
+const { ethers } = require('ethers');
+const { createWatcher } = require('../watcher');
+
+async function main() {
+  const root = path.join(__dirname, '..');
+  const sources = {
+    'FlashLoanBot.sol': { content: fs.readFileSync(path.join(root, 'FlashLoanBot.sol'), 'utf8') },
+    'Mocks.sol': { content: fs.readFileSync(path.join(__dirname, 'Mocks.sol'), 'utf8') },
+  };
+  const output = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources, settings: { outputSelection: { '*': { '*': ['abi', 'evm.bytecode'] } } } })));
+  const errs = (output.errors || []).filter(e => e.severity === 'error');
+  if (errs.length) { for (const e of errs) console.log(e.formattedMessage); console.log('COMPILE FAILED'); process.exit(1); }
+  console.log('COMPILE OK');
+  const get = (f, n) => ({ abi: output.contracts[f][n].abi, bytecode: '0x' + output.contracts[f][n].evm.bytecode.object });
+  const server = ganache.server(); await server.listen(8547);
+  const provider = new ethers.JsonRpcProvider('http://127.0.0.1:8547');
+  const owner = await provider.getSigner(0);
+  const ownerAddr = await owner.getAddress();
+  async function deploy(f, n, args) {
+    const { abi, bytecode } = get(f, n);
+    const c = await new ethers.ContractFactory(abi, bytecode, owner).deploy(...args);
+    await c.waitForDeployment(); return c;
+  }
+  const tokenA = await deploy('Mocks.sol', 'MockToken', ['A']);
+  const tokenB = await deploy('Mocks.sol', 'MockToken', ['B']);
+  const pool = await deploy('Mocks.sol', 'MockPool', []);
+  const prov = await deploy('Mocks.sol', 'MockProvider', [await pool.getAddress()]);
+  const router = await deploy('Mocks.sol', 'MockRouter', []);
+  const bot = await deploy('FlashLoanBot.sol', 'FlashLoanBot', [await prov.getAddress()]);
+  const A = await tokenA.getAddress(), B = await tokenB.getAddress();
+  const botAddr = await bot.getAddress(), poolAddr = await pool.getAddress(), routerAddr = await router.getAddress();
+  await tokenA.mint(poolAddr, 1000000); await tokenA.mint(routerAddr, 1000000); await tokenB.mint(routerAddr, 1000000);
+
+  const watcher = createWatcher({
+    signer: owner, botAddress: botAddr, routerAddress: routerAddr, tokenA: A, tokenB: B,
+    config: { loanAmount: 1000n, minProfit: 50n, premiumBps: 10n, slippageBps: 50n, dryRun: false },
+  });
+  async function withdrawProfit() {
+    const bal = await tokenA.balanceOf(botAddr);
+    if (bal > 0n) { const tx = await bot.withdrawToken(A, ownerAddr, bal); await tx.wait(); }
+  }
+  let pass = 0, fail = 0;
+  function check(name, cond) { console.log(cond ? `PASS ${name}` : `FAIL ${name}`); cond ? pass++ : fail++; }
+
+  // Cycle 1: rate 110% -> expected final 1210, profit 209 >= 50 -> TRADE
+  await router.setRate(11000);
+  let r = await watcher.evaluateCycle();
+  console.log('CYCLE 1 rate 110%:', r.action, '-', r.reason);
+  check('Cycle 1 triggers profitable trade', r.action === 'trade' && (await tokenA.balanceOf(botAddr)) === 209n);
+  await withdrawProfit();
+
+  // Cycle 2: rate 90% -> expected final 810, profit -191 -> SKIP, no tx, bot balance stays 0
+  await router.setRate(9000);
+  r = await watcher.evaluateCycle();
+  console.log('CYCLE 2 rate 90%:', r.action, '-', r.reason);
+  check('Cycle 2 skips losing trade', r.action === 'skip' && (await tokenA.balanceOf(botAddr)) === 0n);
+
+  // Cycle 3: rate 102% -> expected final 1040, profit 39 < MIN_PROFIT 50 -> SKIP (tuning: marginal trade filtered)
+  await router.setRate(10200);
+  r = await watcher.evaluateCycle();
+  console.log('CYCLE 3 rate 102%:', r.action, '-', r.reason);
+  check('Cycle 3 skips marginal trade below MIN_PROFIT', r.action === 'skip' && (await tokenA.balanceOf(botAddr)) === 0n);
+
+  // Cycle 4, tuned: lower MIN_PROFIT to 25 -> same 102% rate now triggers, profit 39 >= 25
+  watcher.config.minProfit = 25n;
+  r = await watcher.evaluateCycle();
+  console.log('CYCLE 4 rate 102%, MIN_PROFIT tuned 50 -> 25:', r.action, '-', r.reason);
+  check('Cycle 4 triggers after tuning MIN_PROFIT down', r.action === 'trade' && (await tokenA.balanceOf(botAddr)) === 39n);
+  await withdrawProfit();
+
+  // Cycle 5: dry-run mode -> would trade, but sends no tx
+  watcher.config.minProfit = 50n; watcher.config.dryRun = true;
+  await router.setRate(11000);
+  r = await watcher.evaluateCycle();
+  console.log('CYCLE 5 dry-run rate 110%:', r.action, '-', r.reason);
+  check('Cycle 5 dry-run sends no trade', r.action === 'dry-run-trade' && (await tokenA.balanceOf(botAddr)) === 0n);
+
+  console.log(`WATCHER TESTS: ${pass} passed, ${fail} failed`);
+  await server.close();
+  if (fail) process.exit(1);
+}
+main().catch(e => { console.error(e); process.exit(1); });
